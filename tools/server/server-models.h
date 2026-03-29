@@ -62,7 +62,7 @@ struct server_model_meta {
     int port = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
-    uint64_t memory_mb = 0; // estimated memory usage in MB
+    uint64_t memory_mb = 0; // size in MB (estimate before load, actual after load)
     std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
@@ -111,7 +111,7 @@ private:
     void update_meta(const std::string & name, const server_model_meta & meta);
 
     // unload least recently used models if the limit is reached
-    void unload_lru();
+    void unload_lru(uint64_t new_model_memory_mb = 0);
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
