@@ -300,6 +300,7 @@ void server_models::load_models() {
             /* port         */ 0,
             /* status       */ SERVER_MODEL_STATUS_UNLOADED,
             /* last_used    */ 0,
+            /* memory_mb    */ 0,
             /* args         */ std::vector<std::string>(),
             /* exit_code    */ 0,
             /* stop_timeout */ DEFAULT_STOP_TIMEOUT,
@@ -494,34 +495,45 @@ std::vector<server_model_meta> server_models::get_all_meta() {
 }
 
 void server_models::unload_lru() {
-    if (base_params.models_max <= 0) {
+    if (base_params.models_max <= 0 && base_params.models_memory_max <= 0) {
         return; // no limit
     }
-    // remove one of the servers if we passed the models_max (least recently used - LRU)
-    std::string lru_model_name = "";
-    int64_t lru_last_used = ggml_time_ms();
-    size_t count_active = 0;
-    {
-        std::unique_lock<std::mutex> lk(mutex);
-        for (const auto & m : mapping) {
-            if (m.second.meta.is_running()) {
-                count_active++;
-                if (m.second.meta.last_used < lru_last_used) {
-                    lru_model_name = m.first;
-                    lru_last_used = m.second.meta.last_used;
+    // Keep unloading LRU models until limits are satisfied
+    while (true) {
+        std::string lru_model_name = "";
+        int64_t lru_last_used = ggml_time_ms();
+        size_t count_active = 0;
+        uint64_t total_memory_mb = 0;
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            for (const auto & m : mapping) {
+                if (m.second.meta.is_running()) {
+                    count_active++;
+                    total_memory_mb += m.second.meta.memory_mb;
+                    if (m.second.meta.last_used < lru_last_used) {
+                        lru_model_name = m.first;
+                        lru_last_used = m.second.meta.last_used;
+                    }
                 }
             }
         }
-    }
-    if (!lru_model_name.empty() && count_active >= (size_t)base_params.models_max) {
-        SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
-        unload(lru_model_name);
-        // wait for unload to complete
-        {
-            std::unique_lock<std::mutex> lk(mutex);
-            cv.wait(lk, [this, &lru_model_name]() {
-                return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
-            });
+        // Check if limits exceeded
+        bool count_exceeded = base_params.models_max > 0 && count_active >= (size_t)base_params.models_max;
+        bool memory_exceeded = base_params.models_memory_max > 0 && total_memory_mb >= (uint64_t)base_params.models_memory_max;
+        if (!lru_model_name.empty() && (count_exceeded || memory_exceeded)) {
+            SRV_INF("limits reached (count=%zu, memory=%lu MB), removing LRU name=%s\n",
+                    count_active, (unsigned long)total_memory_mb, lru_model_name.c_str());
+            unload(lru_model_name);
+            // wait for unload to complete
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                cv.wait(lk, [this, &lru_model_name]() {
+                    return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
+                });
+            }
+            // Loop continues to check if more unloading is needed
+        } else {
+            break; // limits satisfied
         }
     }
 }
@@ -544,14 +556,18 @@ void server_models::load(const std::string & name) {
     // exceeding models_max. Without this, the window between unload_lru()
     // releasing its lock and this lock_guard acquiring allows multiple
     // threads to each observe capacity and all proceed to load.
-    if (base_params.models_max > 0) {
+    if (base_params.models_max > 0 || base_params.models_memory_max > 0) {
         size_t count_active = 0;
+        uint64_t total_memory_mb = 0;
         for (const auto & m : mapping) {
             if (m.second.meta.is_running()) {
                 count_active++;
+                total_memory_mb += m.second.meta.memory_mb;
             }
         }
-        if (count_active >= (size_t)base_params.models_max) {
+        bool count_exceeded = base_params.models_max > 0 && count_active >= (size_t)base_params.models_max;
+        bool memory_exceeded = base_params.models_memory_max > 0 && total_memory_mb >= (uint64_t)base_params.models_memory_max;
+        if (count_exceeded || memory_exceeded) {
             throw std::runtime_error("model limit reached, try again later");
         }
     }
@@ -608,10 +624,35 @@ void server_models::load(const std::string & name) {
             // also handle status report from child process
             if (stdout_file) {
                 char buffer[4096];
+                bool ready_received = false;
                 while (fgets(buffer, sizeof(buffer), stdout_file) != nullptr) {
                     LOG("[%5d] %s", port, buffer);
                     std::string str(buffer);
                     if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_READY)) {
+                        // Query memory usage from the child's /props endpoint
+                        if (!ready_received) {
+                            ready_received = true;
+                            try {
+                                httplib::Client cli("http://CHILD_ADDR");
+                                cli.set_connection_timeout(5, 0);
+                                if (auto res = cli.Get("/props")) {
+                                    if (res->status == 200) {
+                                        json props = json::parse(res->body);
+                                        if (props.contains("memory_mb")) {
+                                            uint64_t memory_mb = props["memory_mb"].get<uint64_t>();
+                                            SRV_INF("model %s loaded, memory usage: %lu MB\n", name.c_str(), (unsigned long)memory_mb);
+                                            // Update memory_mb in meta
+                                            std::lock_guard<std::mutex> lk(this->mutex);
+                                            if (mapping.find(name) != mapping.end()) {
+                                                mapping[name].meta.memory_mb = memory_mb;
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (const std::exception & e) {
+                                SRV_WRN("failed to query memory for model %s: %s\n", name.c_str(), e.what());
+                            }
+                        }
                         this->update_status(name, SERVER_MODEL_STATUS_LOADED, 0);
                     } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_SLEEP)) {
                         this->update_status(name, SERVER_MODEL_STATUS_SLEEPING, 0);

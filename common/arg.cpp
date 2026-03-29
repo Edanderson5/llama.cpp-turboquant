@@ -3043,6 +3043,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MAX"));
     add_opt(common_arg(
+        {"--models-memory-max"}, "N",
+        string_format("for router server, maximum memory usage in MB (default: %d, 0 = unlimited)", params.models_memory_max),
+        [](common_params & params, int value) {
+            params.models_memory_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MEMORY_MAX"));
+    add_opt(common_arg(
         {"--models-autoload"},
         {"--no-models-autoload"},
         string_format("for router server, whether to automatically load models (default: %s)", params.models_autoload ? "enabled" : "disabled"),
