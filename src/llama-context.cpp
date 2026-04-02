@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -279,6 +280,14 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // Initialize TurboQuant if sidecar path provided
+        if (params.turboquant_meta_path) {
+            auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+            if (kv) {
+                kv->init_turboquant(params.turboquant_meta_path, cparams.n_ctx_seq);
+            }
+        }
     }
 
     // init backends
@@ -1687,6 +1696,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
 
+        // TurboQuant: quantize+dequantize newly written KV rows
+        if (res) {
+            auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx.get());
+            if (kv_mctx) {
+                kv_mctx->turboquant_post_process_current();
+            }
+        }
+
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
@@ -2904,6 +2921,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.turboquant_meta_path        =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

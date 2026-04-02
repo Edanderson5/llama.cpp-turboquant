@@ -2019,6 +2019,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"-tqmeta", "--turboquant-meta"}, "PATH",
+        "path to .tqmeta sidecar file for TurboQuant KV cache compression (3-bit)",
+        [](common_params & params, const std::string & value) {
+            params.turboquant_meta_path = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

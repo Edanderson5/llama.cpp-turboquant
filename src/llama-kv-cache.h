@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-turboquant.h"
 
 #include <unordered_map>
 #include <vector>
@@ -268,6 +269,20 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    // TurboQuant KV cache compression state (Phase 1: CPU quantize/dequant)
+    std::unique_ptr<turboquant::state> tq_state;
+
+public:
+    // Initialize TurboQuant from .tqmeta sidecar path
+    void init_turboquant(const std::string & tqmeta_path, uint32_t kv_size);
+
+    // Post-process newly written KV rows: quantize then dequantize in-place
+    void turboquant_post_process(const slot_info & sinfo);
+
+    bool is_turboquant() const { return tq_state && tq_state->enabled; }
+
+private:
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -379,6 +394,9 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // TurboQuant: post-process current ubatch's KV rows
+    void turboquant_post_process_current();
 
 private:
     llama_memory_status status;

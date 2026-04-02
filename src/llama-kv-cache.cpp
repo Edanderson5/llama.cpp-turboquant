@@ -2490,3 +2490,63 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
 }
+
+// -------------------------------------------------------------------------
+// TurboQuant integration
+// -------------------------------------------------------------------------
+
+void llama_kv_cache_context::turboquant_post_process_current() {
+    if (!kv || !kv->is_turboquant()) return;
+    if (i_cur == 0 || i_cur > sinfos.size()) return;
+
+    // i_cur was already incremented by next(), so the just-processed ubatch is at i_cur - 1
+    const auto & sinfo = sinfos[i_cur - 1];
+    kv->turboquant_post_process(sinfo);
+}
+
+void llama_kv_cache::init_turboquant(const std::string & tqmeta_path, uint32_t kv_size) {
+    if (tqmeta_path.empty()) return;
+
+    int head_dim = 0;
+    int n_kv_heads = 0;
+    if (!layers.empty()) {
+        head_dim   = hparams.n_embd_head_k(layers[0].il);
+        n_kv_heads = hparams.n_head_kv(layers[0].il);
+    }
+
+    if (head_dim == 0 || n_kv_heads == 0) {
+        LLAMA_LOG_WARN("%s: cannot init turboquant - no KV layers\n", __func__);
+        return;
+    }
+
+    try {
+        tq_state = turboquant::init(tqmeta_path, kv_size, (int)layers.size(), n_kv_heads, head_dim);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: turboquant init failed: %s\n", __func__, e.what());
+        tq_state.reset();
+    }
+}
+
+void llama_kv_cache::turboquant_post_process(const slot_info & sinfo) {
+    if (!tq_state || !tq_state->enabled) return;
+    if (sinfo.empty()) return;
+
+    for (size_t s = 0; s < sinfo.idxs.size(); s++) {
+        for (uint32_t row_idx : sinfo.idxs[s]) {
+            for (size_t li = 0; li < layers.size(); li++) {
+                int n_kv_heads = hparams.n_head_kv(layers[li].il);
+                int head_dim   = hparams.n_embd_head_k(layers[li].il);
+
+                turboquant::post_process_row(
+                    *tq_state,
+                    layers[li].k,
+                    layers[li].v,
+                    row_idx,
+                    (uint32_t)li,
+                    n_kv_heads,
+                    head_dim
+                );
+            }
+        }
+    }
+}
