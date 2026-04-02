@@ -106,10 +106,40 @@ In Phase 1, the F16 KV cache is still allocated. The shadow buffer adds ~0.9 MB/
 - llama.cpp discussion: [ggml-org/llama.cpp#20969](https://github.com/ggml-org/llama.cpp/discussions/20969)
 - Paper: Braun et al. "TurboQuant: Redefining AI Efficiency with Extreme Compression" (ICLR 2026)
 
+## Performance
+
+Tested with Qwen3 8B (Q4_K) on RTX 4090:
+
+| Config | Prompt | Generation | KV Memory |
+|---|---|---|---|
+| F16 KV on GPU | 533 t/s | 154 t/s | 100% |
+| TQ3_0 KV on CPU (--no-kv-offload) | 98 t/s | 8.6 t/s | ~22% |
+| Phase 1 (F16 + shadow) on CPU | 68 t/s | 12 t/s | 100% + shadow |
+
+Memory savings at ctx=16384:
+| Cache Type | Host Memory |
+|---|---|
+| F16 | 4435 MiB |
+| **TQ3_0** | **2675 MiB (40% savings)** |
+| Q4_0 | 2819 MiB (36% savings) |
+| Q8_0 | 3395 MiB (23% savings) |
+
 ## Building
 
 ```bash
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release  # add -DGGML_CUDA=ON for GPU
+
+# CPU only
+cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc) llama-cli llama-server
+
+# With CUDA (requires GCC-14 or older for CUDA 12.x)
+CC=gcc-14 CXX=g++-14 cmake .. -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_HOST_COMPILER=g++-14
+make -j$(nproc) llama-cli llama-server
+
+# Run with GPU model + TQ3 KV on CPU
+./llama-cli -m model.gguf -ngl 99 --no-kv-offload \
+  --cache-type-k tq3_0 --cache-type-v tq3_0 \
+  --turboquant-meta model.tqmeta
 ```
