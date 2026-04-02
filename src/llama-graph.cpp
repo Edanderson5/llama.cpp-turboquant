@@ -1866,8 +1866,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
 
-        // TurboQuant K: pass directly to flash attention (fused vec_dot handles TQ3_0)
-        // No cast needed — the flash_attn kernel has a native TQ3_0 vec_dot_KQ
+        // TurboQuant: cast TQ3_0 to F16 for flash attention
+        // (fused vec_dot WIP — use cast path for correct output)
+        if (k->type == GGML_TYPE_TQ3_0) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
 
         if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
