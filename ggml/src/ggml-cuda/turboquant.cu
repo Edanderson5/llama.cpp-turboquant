@@ -149,7 +149,11 @@ static __device__ void tq3_dequant_block_hadamard(const block_tq3_0 * src, float
 // Q_proj = rotate_hadamard_s(Q) → O(d log d)
 // Then Q·K = x_norm * (dot(Q_rot, centroids[idx]) + qjl * gamma * dot(Q_proj, signs))
 
-// Fused flash attention with Hadamard rotation
+// 4-warp Hadamard fused attention: 4x better latency hiding
+// blockDim = (32, NWARPS), each warp processes every NWARPS-th KV position
+// Warp 0 also does the Q precompute (shared across all warps via smem)
+#define TQ3_NWARPS 4
+
 template<int D>
 __global__ void flash_attn_tq3_hadamard(
     const float * __restrict__ Q,
@@ -167,44 +171,49 @@ __global__ void flash_attn_tq3_hadamard(
     const int head = blockIdx.x;
     const int token = blockIdx.y;
     const int seq = blockIdx.z;
-    const int lane = threadIdx.x;
+    const int lane = threadIdx.x;    // 0-31
+    const int warp_id = threadIdx.y; // 0-(NWARPS-1)
 
     if (head >= ne02 || token >= ne01) return;
 
     const int kv_head = ne12 > 0 ? head / (ne02 / ne12) : 0;
     const float * Q_head = (const float *)((const char *)Q + seq*q_nb3 + head*q_nb2 + token*q_nb1);
 
+    // Shared memory layout:
+    // [0, D)       = Q_rot
+    // [D, 2D)      = Q_proj
+    // [2D, 2D + NWARPS*3) = per-warp merge data (KQ_max, KQ_sum, dummy)
+    // [2D + NWARPS*3, 2D + NWARPS*3 + NWARPS*D) = per-warp VKQ accumulators
     extern __shared__ float smem[];
-    float * Q_rot  = smem;
-    float * Q_proj = smem + D;
+    float * Q_rot   = smem;
+    float * Q_proj  = smem + D;
+    float * warp_meta = smem + 2*D;  // [NWARPS * 2]: KQ_max, KQ_sum per warp
+    float * warp_VKQ  = smem + 2*D + TQ3_NWARPS*2; // [NWARPS * D]
 
-    // Precompute Q_rot and Q_proj using HADAMARD: O(d log d) instead of O(d²)!
-    // Load Q into shared memory
-    for (int i = lane; i < D; i += 32) {
-        Q_rot[i] = Q_head[i];
-        Q_proj[i] = Q_head[i];
+    // Step 1: Precompute Q_rot and Q_proj using WARP-PARALLEL WHT
+    // Only warp 0 does this (shared result via smem)
+    if (warp_id == 0) {
+        for (int i = lane; i < D; i += 32) {
+            Q_rot[i] = Q_head[i];
+            Q_proj[i] = Q_head[i];
+        }
+        __syncwarp();
+        rotate_hadamard_warp<D>(Q_rot, d_had_state.signs_pi, lane);
+        rotate_hadamard_warp<D>(Q_proj, d_had_state.signs_s, lane);
     }
-    __syncwarp();
+    __syncthreads(); // All warps wait for Q_rot/Q_proj
 
-    // Apply Hadamard rotation (single-thread for now — could parallelize butterfly)
-    if (lane == 0) {
-        rotate_hadamard<D>(Q_rot, d_had_state.signs_pi);
-        rotate_hadamard<D>(Q_proj, d_had_state.signs_s);
-    }
-    __syncwarp();
-
-    // Online softmax attention over KV positions
+    // Step 2: Each warp processes every NWARPS-th KV position
+    const int ept = (D + 31) / 32;
     float KQ_max = -FLT_MAX;
     float KQ_sum = 0.0f;
-    const int ept = (D + 31) / 32;
-    float VKQ[8];
+    float VKQ[8]; // max ept = D/32 = 4 for D=128
     for (int e = 0; e < ept; e++) VKQ[e] = 0.0f;
 
-    for (int kv = 0; kv < ne11; kv++) {
+    for (int kv = warp_id; kv < ne11; kv += TQ3_NWARPS) {
         const block_tq3_0 * K_block = (const block_tq3_0 *)(
             K + seq*k_nb3 + kv_head*(int64_t)k_nb2 + (int64_t)kv*k_nb1);
 
-        // O(d) QK dot product
         float dot_mse = 0.0f, dot_qjl = 0.0f;
         for (int j = lane; j < D; j += 32) {
             int bp = j * 2;
@@ -238,12 +247,50 @@ __global__ void flash_attn_tq3_hadamard(
         KQ_max = KQ_max_new;
     }
 
-    float inv_sum = 1.0f / (KQ_sum + 1e-8f);
-    float * out = (float *)((char *)dst_data + seq*ne02*ne01*D*sizeof(float) +
-                             head*ne01*D*sizeof(float) + token*D*sizeof(float));
+    // Step 3: Merge softmax across warps
+    // Each warp writes its KQ_max, KQ_sum, and VKQ to shared memory
+    if (lane == 0) {
+        warp_meta[warp_id * 2 + 0] = KQ_max;
+        warp_meta[warp_id * 2 + 1] = KQ_sum;
+    }
     for (int e = 0; e < ept; e++) {
         int i = lane + e * 32;
-        if (i < D) out[i] = VKQ[e] * inv_sum;
+        if (i < D) warp_VKQ[warp_id * D + i] = VKQ[e];
+    }
+    __syncthreads();
+
+    // Warp 0 does the final merge
+    if (warp_id == 0) {
+        // Find global max
+        float global_max = -FLT_MAX;
+        for (int w = 0; w < TQ3_NWARPS; w++) {
+            global_max = fmaxf(global_max, warp_meta[w * 2 + 0]);
+        }
+
+        // Reweight each warp's contribution
+        float global_sum = 0.0f;
+        float corrections[TQ3_NWARPS];
+        for (int w = 0; w < TQ3_NWARPS; w++) {
+            corrections[w] = expf(warp_meta[w * 2 + 0] - global_max);
+            global_sum += warp_meta[w * 2 + 1] * corrections[w];
+        }
+
+        float inv_sum = 1.0f / (global_sum + 1e-8f);
+
+        // Merge VKQ with corrections and write output
+        float * out = (float *)((char *)dst_data + seq*ne02*ne01*D*sizeof(float) +
+                                 head*ne01*D*sizeof(float) + token*D*sizeof(float));
+
+        for (int e = 0; e < ept; e++) {
+            int i = lane + e * 32;
+            if (i < D) {
+                float val = 0.0f;
+                for (int w = 0; w < TQ3_NWARPS; w++) {
+                    val += warp_VKQ[w * D + i] * corrections[w];
+                }
+                out[i] = val * inv_sum;
+            }
+        }
     }
 }
 
@@ -801,10 +848,12 @@ bool ggml_cuda_flash_attn_ext_tq3(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     const int ne01 = Q->ne[1], ne02 = Q->ne[2], ne03 = Q->ne[3];
     const int ne11 = K->ne[1], ne12 = K->ne[2];
-    const int smem = 2 * D * sizeof(float);
+
+    // Shared memory: Q_rot[D] + Q_proj[D] + warp_meta[NWARPS*2] + warp_VKQ[NWARPS*D]
+    const int smem = (2*D + TQ3_NWARPS*2 + TQ3_NWARPS*D) * sizeof(float);
 
     dim3 grid(ne02, ne01, ne03);
-    dim3 block(32);
+    dim3 block(32, TQ3_NWARPS);  // 4 warps per block
     cudaStream_t stream = ctx.stream();
 
     const int mask_nb1 = mask ? mask->nb[1] : 0;

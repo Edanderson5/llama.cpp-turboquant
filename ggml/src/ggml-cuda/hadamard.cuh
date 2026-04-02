@@ -10,14 +10,41 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-// In-place Walsh-Hadamard Transform on d elements in registers
+// In-place Walsh-Hadamard Transform on d elements in shared memory
 // d must be a power of 2 (128 or 256)
-// Each element is processed by one thread; requires warp shuffle for butterfly
-//
-// For single-thread version (one thread owns all d elements):
+// WARP-PARALLEL version: all 32 threads cooperate on the butterfly
+template<int d>
+__device__ __forceinline__ void wht_inplace_warp(float * x, int lane) {
+    // Each butterfly stage: d/2 independent pairs
+    // 32 threads handle d/2 pairs → each thread handles d/64 pairs
+    for (int stride = 1; stride < d; stride *= 2) {
+        // Each pair: (i, i^stride) where i < i^stride
+        for (int base = lane; base < d/2; base += 32) {
+            // Map flat index to butterfly pair
+            // The pairs at this stride: for each block of 2*stride,
+            // pair up elements [block_start + k] and [block_start + k + stride]
+            int block = base / stride;
+            int offset = base % stride;
+            int i = block * 2 * stride + offset;
+            int j = i + stride;
+            float a = x[i];
+            float b = x[j];
+            x[i] = a + b;
+            x[j] = a - b;
+        }
+        __syncwarp();
+    }
+    // Normalize
+    float scale = 1.0f / sqrtf((float)d);
+    for (int i = lane; i < d; i += 32) {
+        x[i] *= scale;
+    }
+    __syncwarp();
+}
+
+// Single-thread version (for backward compatibility)
 template<int d>
 __device__ __forceinline__ void wht_inplace(float * x) {
-    // Butterfly stages: log2(d) stages
     for (int stride = 1; stride < d; stride *= 2) {
         for (int i = 0; i < d; i++) {
             int j = i ^ stride;
@@ -29,7 +56,6 @@ __device__ __forceinline__ void wht_inplace(float * x) {
             }
         }
     }
-    // Normalize
     float scale = 1.0f / sqrtf((float)d);
     for (int i = 0; i < d; i++) {
         x[i] *= scale;
@@ -48,6 +74,25 @@ __device__ __forceinline__ void rotate_hadamard(float * x, const uint8_t * signs
     }
     // Step 2: WHT in-place
     wht_inplace<d>(x);
+}
+
+// WARP-PARALLEL versions: all 32 threads cooperate
+template<int d>
+__device__ __forceinline__ void rotate_hadamard_warp(float * x, const uint8_t * signs, int lane) {
+    for (int i = lane; i < d; i += 32) {
+        if ((signs[i / 8] >> (i % 8)) & 1) x[i] = -x[i];
+    }
+    __syncwarp();
+    wht_inplace_warp<d>(x, lane);
+}
+
+template<int d>
+__device__ __forceinline__ void inverse_rotate_hadamard_warp(float * x, const uint8_t * signs, int lane) {
+    wht_inplace_warp<d>(x, lane);
+    for (int i = lane; i < d; i += 32) {
+        if ((signs[i / 8] >> (i % 8)) & 1) x[i] = -x[i];
+    }
+    __syncwarp();
 }
 
 // Inverse: WHT then apply signs (WHT is self-inverse up to scaling)
