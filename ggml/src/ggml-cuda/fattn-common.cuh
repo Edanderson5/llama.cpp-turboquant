@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "turboquant.cuh"
 
 #include <cstdint>
 
@@ -578,6 +579,49 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
 }
 
 template <ggml_type type_K, int D, int nthreads>
+// TQ3_0 vec_dot: compute Q·K from packed TQ3 representation
+// Q_v contains precomputed Q_rot (Q@Pi^T), Q_ds contains Q_proj (Q@S^T)
+// This is O(d) per KV token instead of O(d²)
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    // Q_v = Q_rot [D floats], Q_ds_v = Q_proj [D floats]
+    const float * Q_rot  = (const float *)Q_v;
+    const float * Q_proj = (const float *)Q_ds_v;
+    const block_tq3_0 * K_block = (const block_tq3_0 *)K_c;
+
+    extern __device__ float * d_centroids;
+    extern __device__ float   d_qjl_factor;
+
+    const float x_norm = K_block->x_norm;
+    const float gamma  = K_block->gamma;
+
+    float dot_mse = 0.0f;
+    float dot_qjl = 0.0f;
+
+    GGML_UNUSED(Q_q8);
+
+#pragma unroll
+    for (int j = threadIdx.x; j < D; j += nthreads) {
+        int bp = j * 2;
+        int idx = (K_block->idx[bp / 8] >> (bp % 8)) & 0x3;
+        dot_mse += Q_rot[j] * __ldg(&d_centroids[idx]);
+
+        float sign_f = (K_block->qjl_sign[j / 8] >> (j % 8)) & 1 ? 1.0f : -1.0f;
+        dot_qjl += Q_proj[j] * sign_f;
+    }
+
+    // Warp reduce
+    for (int mask = nthreads/2; mask > 0; mask >>= 1) {
+        dot_mse += __shfl_xor_sync(0xffffffff, dot_mse, mask);
+        dot_qjl += __shfl_xor_sync(0xffffffff, dot_qjl, mask);
+    }
+
+    return x_norm * (dot_mse + d_qjl_factor * gamma * dot_qjl);
+}
+
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
@@ -593,6 +637,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ3_0) {
+        return vec_dot_fattn_vec_KQ_tq3_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
