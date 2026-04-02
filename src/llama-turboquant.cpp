@@ -20,6 +20,10 @@
 #include <fstream>
 #include <stdexcept>
 
+#ifdef GGML_USE_CUDA
+extern "C" void tq3_cuda_init_from_host(const float*, const float*, const float*, int, int, float);
+#endif
+
 namespace turboquant {
 
 // -------------------------------------------------------------------------
@@ -546,6 +550,14 @@ void register_ggml_type(const state & st) {
         GGML_TYPE_TQ3_0,
         (ggml_from_float_t)quantize_row_tq3_0
     );
+
+    // Initialize CUDA device state if CUDA is available
+#ifdef GGML_USE_CUDA
+    ::tq3_cuda_init_from_host(
+        st.m.pi.data(), st.m.s.data(), st.m.centroids.data(),
+        st.m.k_centroids, st.m.head_dim, (float)st.m.qjl_factor
+    );
+#endif
 
     fprintf(stderr, "turboquant: registered GGML_TYPE_TQ3_0 dequant/quant functions\n");
 }

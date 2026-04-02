@@ -309,6 +309,24 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_TQ3_0) {
+        // TurboQuant uses device globals for Pi/S/centroids — handled in turboquant.cu
+        extern void tq3_cuda_set_rows(
+            const float * src0_d, const void * src1_d, void * dst_d,
+            int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+            int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
+            size_t nb01, size_t nb02, size_t nb03,
+            size_t nb10, size_t nb11, size_t nb12,
+            size_t nb1, size_t nb2, size_t nb3,
+            bool idx64, cudaStream_t stream);
+        tq3_cuda_set_rows(
+            src0_d, (const void*)src1_d, dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            sizeof(idx_t) == 8, stream);
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
