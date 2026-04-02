@@ -22,9 +22,15 @@ struct meta {
     int      codebook_id  = 0;  // 0=paper, 1=ternary
     double   qjl_factor   = 0.0;
 
+    bool     hadamard     = false;   // true = use WHT rotation (v3 sidecar)
+
     std::vector<float> centroids;  // [k_centroids]
-    std::vector<float> pi;         // [head_dim * head_dim] row-major
-    std::vector<float> s;          // [head_dim * head_dim] row-major
+    std::vector<float> pi;         // [head_dim * head_dim] row-major (dense mode)
+    std::vector<float> s;          // [head_dim * head_dim] row-major (dense mode)
+
+    // Hadamard mode: packed sign bits instead of dense matrices
+    std::vector<uint8_t> signs_pi; // [head_dim/8] bit-packed
+    std::vector<uint8_t> signs_s;  // [head_dim/8] bit-packed
 };
 
 // Byte layout for one packed head-row

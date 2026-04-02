@@ -22,6 +22,7 @@
 
 #ifdef GGML_USE_CUDA
 extern "C" void tq3_cuda_init_from_host(const float*, const float*, const float*, int, int, float);
+extern "C" void tq3_cuda_init_hadamard_from_host(const uint8_t*, const uint8_t*, const float*, int, int, float);
 #endif
 
 namespace turboquant {
@@ -82,6 +83,17 @@ meta load_meta(const std::string & path) {
         m.codebook_id = int(cbid);
         read_f64(blob.data() + 32, m.qjl_factor);
         hlen = 40;
+    } else if (ver == 3) {
+        // Version 3: Hadamard mode — signs instead of dense matrices
+        read_f64(blob.data() + 12, m.bits);
+        read_u32(blob.data() + 20, d);
+        read_u32(blob.data() + 24, k);
+        uint32_t cbid = 0;
+        read_u32(blob.data() + 28, cbid);
+        m.codebook_id = int(cbid);
+        read_f64(blob.data() + 32, m.qjl_factor);
+        m.hadamard = true;
+        hlen = 40;
     } else {
         throw std::runtime_error("turboquant: unsupported version " + std::to_string(ver));
     }
@@ -89,21 +101,39 @@ meta load_meta(const std::string & path) {
     m.head_dim     = int(d);
     m.k_centroids  = int(k);
 
-    size_t need = hlen + size_t(k) * 4u + 2u * size_t(d) * size_t(d) * 4u;
-    if (blob.size() < need) {
-        throw std::runtime_error("turboquant: truncated payload");
+    if (m.hadamard) {
+        // V3 payload: centroids[k] + signs_pi[d/8] + signs_s[d/8]
+        size_t sign_bytes = (d + 7) / 8;
+        size_t need = hlen + size_t(k) * 4u + 2 * sign_bytes;
+        if (blob.size() < need) {
+            throw std::runtime_error("turboquant: truncated Hadamard payload");
+        }
+        m.centroids.resize(k);
+        m.signs_pi.resize(sign_bytes);
+        m.signs_s.resize(sign_bytes);
+        size_t off = hlen;
+        std::memcpy(m.centroids.data(), blob.data() + off, k * 4u);
+        off += k * 4u;
+        std::memcpy(m.signs_pi.data(), blob.data() + off, sign_bytes);
+        off += sign_bytes;
+        std::memcpy(m.signs_s.data(), blob.data() + off, sign_bytes);
+        fprintf(stderr, "turboquant: loaded Hadamard sidecar (%zu bytes)\n", need);
+    } else {
+        // V1/V2 payload: centroids[k] + Pi[d*d] + S[d*d]
+        size_t need = hlen + size_t(k) * 4u + 2u * size_t(d) * size_t(d) * 4u;
+        if (blob.size() < need) {
+            throw std::runtime_error("turboquant: truncated payload");
+        }
+        m.centroids.resize(k);
+        m.pi.resize(size_t(d) * size_t(d));
+        m.s.resize(size_t(d) * size_t(d));
+        size_t off = hlen;
+        std::memcpy(m.centroids.data(), blob.data() + off, k * 4u);
+        off += k * 4u;
+        std::memcpy(m.pi.data(), blob.data() + off, size_t(d) * size_t(d) * 4u);
+        off += size_t(d) * size_t(d) * 4u;
+        std::memcpy(m.s.data(), blob.data() + off, size_t(d) * size_t(d) * 4u);
     }
-
-    m.centroids.resize(k);
-    m.pi.resize(size_t(d) * size_t(d));
-    m.s.resize(size_t(d) * size_t(d));
-
-    size_t off = hlen;
-    std::memcpy(m.centroids.data(), blob.data() + off, k * 4u);
-    off += k * 4u;
-    std::memcpy(m.pi.data(), blob.data() + off, size_t(d) * size_t(d) * 4u);
-    off += size_t(d) * size_t(d) * 4u;
-    std::memcpy(m.s.data(), blob.data() + off, size_t(d) * size_t(d) * 4u);
 
     double expected_qjl = std::sqrt(M_PI / 2.0) / double(d);
     if (std::abs(m.qjl_factor - expected_qjl) > 1e-5) {
@@ -600,10 +630,18 @@ void register_ggml_type(const state & st) {
 
     // Initialize CUDA device state if CUDA is available
 #ifdef GGML_USE_CUDA
-    ::tq3_cuda_init_from_host(
-        st.m.pi.data(), st.m.s.data(), st.m.centroids.data(),
-        st.m.k_centroids, st.m.head_dim, (float)st.m.qjl_factor
-    );
+    if (st.m.hadamard) {
+        // declared at file scope below
+        ::tq3_cuda_init_hadamard_from_host(
+            st.m.signs_pi.data(), st.m.signs_s.data(), st.m.centroids.data(),
+            st.m.k_centroids, st.m.head_dim, (float)st.m.qjl_factor
+        );
+    } else {
+        ::tq3_cuda_init_from_host(
+            st.m.pi.data(), st.m.s.data(), st.m.centroids.data(),
+            st.m.k_centroids, st.m.head_dim, (float)st.m.qjl_factor
+        );
+    }
 #endif
 
     fprintf(stderr, "turboquant: registered GGML_TYPE_TQ3_0 dequant/quant functions\n");

@@ -1,10 +1,251 @@
 // TurboQuant CUDA — all device code in one TU for __device__ global visibility
 #include "turboquant.cuh"
+#include "hadamard.cuh"
 #include "common.cuh"
 #include <cuda_fp16.h>
 #include <cstdio>
 #include <cmath>
 #include <cfloat>
+
+// =====================================================================
+// Hadamard mode device state (compact: 64 bytes vs 128KB for dense)
+// =====================================================================
+static __device__ tq3_hadamard_state d_had_state;
+static bool h_had_initialized = false;
+
+void tq3_cuda_init_hadamard(const uint8_t * signs_pi, const uint8_t * signs_s,
+                             const float * centroids, int k_centroids,
+                             int head_dim, float qjl_factor) {
+    tq3_hadamard_state h_state;
+    memset(&h_state, 0, sizeof(h_state));
+    memcpy(h_state.signs_pi, signs_pi, (head_dim + 7) / 8);
+    memcpy(h_state.signs_s, signs_s, (head_dim + 7) / 8);
+    memcpy(h_state.centroids, centroids, k_centroids * sizeof(float));
+    h_state.qjl_factor = qjl_factor;
+    h_state.head_dim = head_dim;
+    h_state.initialized = true;
+
+    cudaMemcpyToSymbol(d_had_state, &h_state, sizeof(tq3_hadamard_state));
+    h_had_initialized = true;
+    fprintf(stderr, "turboquant CUDA: Hadamard mode initialized (64 bytes device state)\n");
+}
+
+// =====================================================================
+// Hadamard quantize: O(d log d) instead of O(d²)
+// =====================================================================
+
+static __device__ void tq3_quantize_block_hadamard(const float * src, block_tq3_0 * dst) {
+    const int d = d_had_state.head_dim;
+    float x[256]; // max head_dim
+
+    // 1. Normalize
+    float norm_sq = 0.0f;
+    for (int i = 0; i < d; i++) { norm_sq += src[i] * src[i]; x[i] = src[i]; }
+    float x_norm = sqrtf(norm_sq);
+    float inv = (x_norm > 1e-8f) ? (1.0f / x_norm) : 0.0f;
+    for (int i = 0; i < d; i++) x[i] *= inv;
+
+    // 2. Forward rotation: O(d log d) Hadamard instead of O(d²) matmul
+    if (d == 128) rotate_hadamard<128>(x, d_had_state.signs_pi);
+    else if (d == 256) rotate_hadamard<256>(x, d_had_state.signs_pi);
+
+    // 3. MSE quantize
+    for (int b = 0; b < TQ3_IDX_BYTES; b++) dst->idx[b] = 0;
+    float yt[256];
+    for (int j = 0; j < d; j++) {
+        int best = 0;
+        float bd = fabsf(x[j] - d_had_state.centroids[0]);
+        for (int c = 1; c < 4; c++) {
+            float dd = fabsf(x[j] - d_had_state.centroids[c]);
+            if (dd < bd) { bd = dd; best = c; }
+        }
+        yt[j] = d_had_state.centroids[best];
+        int bp = j * 2;
+        dst->idx[bp / 8] |= (uint8_t)((best & 0x3) << (bp % 8));
+    }
+
+    // 4. Inverse rotation + residual: O(d log d)
+    float x_tilde[256];
+    for (int i = 0; i < d; i++) x_tilde[i] = yt[i];
+    if (d == 128) inverse_rotate_hadamard<128>(x_tilde, d_had_state.signs_pi);
+    else if (d == 256) inverse_rotate_hadamard<256>(x_tilde, d_had_state.signs_pi);
+
+    // x was already rotated, inverse of rotation applied to yt gives us x_tilde in original space
+    // residual in original (unrotated) space:
+    // Actually we need to un-rotate x first. But we normalized x_unit and rotated it.
+    // Let me reconsider: x_unit → rotate → quantize → yt → inverse_rotate → x_tilde
+    // residual r = x_unit - x_tilde (in original space)
+    // But x was modified in-place by rotate_hadamard...
+    // We need to keep a copy of x_unit before rotation.
+
+    // Let me redo with explicit copy:
+    float x_unit[256];
+    for (int i = 0; i < d; i++) x_unit[i] = src[i] * inv;
+
+    float r[256];
+    for (int i = 0; i < d; i++) r[i] = x_unit[i] - x_tilde[i];
+
+    float g2 = 0.0f;
+    for (int i = 0; i < d; i++) g2 += r[i] * r[i];
+
+    // 5. QJL: project residual through S (Hadamard)
+    float u[256];
+    for (int i = 0; i < d; i++) u[i] = r[i];
+    if (d == 128) rotate_hadamard<128>(u, d_had_state.signs_s);
+    else if (d == 256) rotate_hadamard<256>(u, d_had_state.signs_s);
+
+    for (int b = 0; b < TQ3_SIGN_BYTES; b++) dst->qjl_sign[b] = 0;
+    for (int j = 0; j < d; j++) {
+        if (u[j] >= 0.0f) dst->qjl_sign[j / 8] |= (uint8_t)(1 << (j % 8));
+    }
+
+    dst->x_norm = x_norm;
+    dst->gamma = sqrtf(g2);
+}
+
+// =====================================================================
+// Hadamard dequantize: O(d log d)
+// =====================================================================
+
+static __device__ void tq3_dequant_block_hadamard(const block_tq3_0 * src, float * dst) {
+    const int d = d_had_state.head_dim;
+
+    // 1. Unpack centroids
+    float yt[256];
+    for (int j = 0; j < d; j++) {
+        int bp = j * 2;
+        int idx = (src->idx[bp / 8] >> (bp % 8)) & 0x3;
+        yt[j] = d_had_state.centroids[idx];
+    }
+
+    // 2. Inverse rotate: O(d log d)
+    if (d == 128) inverse_rotate_hadamard<128>(yt, d_had_state.signs_pi);
+    else if (d == 256) inverse_rotate_hadamard<256>(yt, d_had_state.signs_pi);
+
+    for (int i = 0; i < d; i++) dst[i] = yt[i];
+
+    // 3. QJL: unpack signs, inverse rotate, scale
+    float sign_vec[256];
+    for (int j = 0; j < d; j++) {
+        sign_vec[j] = (src->qjl_sign[j / 8] >> (j % 8)) & 1 ? 1.0f : -1.0f;
+    }
+    if (d == 128) inverse_rotate_hadamard<128>(sign_vec, d_had_state.signs_s);
+    else if (d == 256) inverse_rotate_hadamard<256>(sign_vec, d_had_state.signs_s);
+
+    float scale = d_had_state.qjl_factor * src->gamma;
+    for (int i = 0; i < d; i++) dst[i] += scale * sign_vec[i];
+
+    // 4. Scale by x_norm
+    float xn = src->x_norm;
+    for (int i = 0; i < d; i++) dst[i] *= xn;
+}
+
+// =====================================================================
+// Hadamard fused QK: precompute Q rotation O(d log d), then O(d) per KV
+// =====================================================================
+
+// For fused attention, the Q precompute becomes:
+// Q_rot = rotate_hadamard(Q)  → O(d log d) instead of O(d²)
+// Q_proj = rotate_hadamard_s(Q) → O(d log d)
+// Then Q·K = x_norm * (dot(Q_rot, centroids[idx]) + qjl * gamma * dot(Q_proj, signs))
+
+// Fused flash attention with Hadamard rotation
+template<int D>
+__global__ void flash_attn_tq3_hadamard(
+    const float * __restrict__ Q,
+    const char  * __restrict__ K,
+    const char  * __restrict__ V,
+    const half  * __restrict__ mask_data,
+    float       * __restrict__ dst_data,
+    const float scale,
+    const int ne01, const int ne02, const int ne11, const int ne12,
+    const int k_nb1, const int k_nb2, const int64_t k_nb3,
+    const int v_nb1, const int v_nb2, const int64_t v_nb3,
+    const int q_nb1, const int q_nb2, const int q_nb3,
+    const int mask_nb1
+) {
+    const int head = blockIdx.x;
+    const int token = blockIdx.y;
+    const int seq = blockIdx.z;
+    const int lane = threadIdx.x;
+
+    if (head >= ne02 || token >= ne01) return;
+
+    const int kv_head = ne12 > 0 ? head / (ne02 / ne12) : 0;
+    const float * Q_head = (const float *)((const char *)Q + seq*q_nb3 + head*q_nb2 + token*q_nb1);
+
+    extern __shared__ float smem[];
+    float * Q_rot  = smem;
+    float * Q_proj = smem + D;
+
+    // Precompute Q_rot and Q_proj using HADAMARD: O(d log d) instead of O(d²)!
+    // Load Q into shared memory
+    for (int i = lane; i < D; i += 32) {
+        Q_rot[i] = Q_head[i];
+        Q_proj[i] = Q_head[i];
+    }
+    __syncwarp();
+
+    // Apply Hadamard rotation (single-thread for now — could parallelize butterfly)
+    if (lane == 0) {
+        rotate_hadamard<D>(Q_rot, d_had_state.signs_pi);
+        rotate_hadamard<D>(Q_proj, d_had_state.signs_s);
+    }
+    __syncwarp();
+
+    // Online softmax attention over KV positions
+    float KQ_max = -FLT_MAX;
+    float KQ_sum = 0.0f;
+    const int ept = (D + 31) / 32;
+    float VKQ[8];
+    for (int e = 0; e < ept; e++) VKQ[e] = 0.0f;
+
+    for (int kv = 0; kv < ne11; kv++) {
+        const block_tq3_0 * K_block = (const block_tq3_0 *)(
+            K + seq*k_nb3 + kv_head*(int64_t)k_nb2 + (int64_t)kv*k_nb1);
+
+        // O(d) QK dot product
+        float dot_mse = 0.0f, dot_qjl = 0.0f;
+        for (int j = lane; j < D; j += 32) {
+            int bp = j * 2;
+            int idx = (K_block->idx[bp / 8] >> (bp % 8)) & 0x3;
+            dot_mse += Q_rot[j] * d_had_state.centroids[idx];
+            float sf = (K_block->qjl_sign[j / 8] >> (j % 8)) & 1 ? 1.0f : -1.0f;
+            dot_qjl += Q_proj[j] * sf;
+        }
+        for (int m = 16; m > 0; m >>= 1) {
+            dot_mse += __shfl_xor_sync(0xffffffff, dot_mse, m);
+            dot_qjl += __shfl_xor_sync(0xffffffff, dot_qjl, m);
+        }
+
+        float KQ_val = K_block->x_norm * (dot_mse + d_had_state.qjl_factor * K_block->gamma * dot_qjl) * scale;
+
+        if (mask_data) {
+            const half * mr = (const half *)((const char *)mask_data + token * mask_nb1);
+            KQ_val += __half2float(mr[kv]);
+        }
+
+        float KQ_max_new = fmaxf(KQ_max, KQ_val);
+        float corr = expf(KQ_max - KQ_max_new);
+        KQ_sum = KQ_sum * corr + expf(KQ_val - KQ_max_new);
+        float w = expf(KQ_val - KQ_max_new);
+
+        const half * V_row = (const half *)(V + seq*v_nb3 + kv_head*(int64_t)v_nb2 + (int64_t)kv*v_nb1);
+        for (int e = 0; e < ept; e++) {
+            int i = lane + e * 32;
+            if (i < D) VKQ[e] = VKQ[e] * corr + w * __half2float(V_row[i]);
+        }
+        KQ_max = KQ_max_new;
+    }
+
+    float inv_sum = 1.0f / (KQ_sum + 1e-8f);
+    float * out = (float *)((char *)dst_data + seq*ne02*ne01*D*sizeof(float) +
+                             head*ne01*D*sizeof(float) + token*D*sizeof(float));
+    for (int e = 0; e < ept; e++) {
+        int i = lane + e * 32;
+        if (i < D) out[i] = VKQ[e] * inv_sum;
+    }
+}
 
 // =====================================================================
 // Device globals (only visible within this TU — no extern needed)
@@ -23,10 +264,16 @@ static float * h_d_centroids = nullptr;
 // Init / free
 // =====================================================================
 
-// C-linkage wrapper for cross-library calls
+// C-linkage wrappers for cross-library calls
 extern "C" void tq3_cuda_init_from_host(const float * pi, const float * s,
                    const float * cent, int k, int d, float qjl) {
     tq3_cuda_init(pi, s, cent, k, d, qjl);
+}
+
+extern "C" void tq3_cuda_init_hadamard_from_host(
+    const uint8_t * signs_pi, const uint8_t * signs_s,
+    const float * cent, int k, int d, float qjl) {
+    tq3_cuda_init_hadamard(signs_pi, signs_s, cent, k, d, qjl);
 }
 
 void tq3_cuda_init(const float * pi_host, const float * s_host,
@@ -222,7 +469,11 @@ static __global__ void k_tq3_set_rows(
     const int64_t dr = src1[ir];
     block_tq3_0 * db = (block_tq3_0 *)((char *)dst + dr * s1) + ih;
 
-    tq3_quantize_block(sb, db);
+    if (d_had_state.initialized) {
+        tq3_quantize_block_hadamard(sb, db);
+    } else {
+        tq3_quantize_block(sb, db);
+    }
 }
 
 static int g_set_rows_calls = 0;
@@ -558,6 +809,33 @@ bool ggml_cuda_flash_attn_ext_tq3(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     const int mask_nb1 = mask ? mask->nb[1] : 0;
 
+    // Dispatch: Hadamard mode (O(d log d) precompute) vs Dense mode (O(d²))
+    if (h_had_initialized) {
+        if (D == 128) {
+            flash_attn_tq3_hadamard<128><<<grid, block, smem, stream>>>(
+                (const float *)Q->data, (const char *)K->data, (const char *)V->data,
+                mask ? (const half *)mask->data : nullptr,
+                (float *)dst->data, scale,
+                ne01, ne02, ne11, ne12,
+                K->nb[1], K->nb[2], K->nb[3],
+                V->nb[1], V->nb[2], V->nb[3],
+                Q->nb[1], Q->nb[2], Q->nb[3],
+                mask_nb1);
+        } else if (D == 256) {
+            flash_attn_tq3_hadamard<256><<<grid, block, smem, stream>>>(
+                (const float *)Q->data, (const char *)K->data, (const char *)V->data,
+                mask ? (const half *)mask->data : nullptr,
+                (float *)dst->data, scale,
+                ne01, ne02, ne11, ne12,
+                K->nb[1], K->nb[2], K->nb[3],
+                V->nb[1], V->nb[2], V->nb[3],
+                Q->nb[1], Q->nb[2], Q->nb[3],
+                mask_nb1);
+        }
+        return true;
+    }
+
+    // Dense mode fallback
     if (D == 128) {
         flash_attn_tq3_vec_impl<128><<<grid, block, smem, stream>>>(
             (const float *)Q->data, (const char *)K->data, (const char *)V->data,
