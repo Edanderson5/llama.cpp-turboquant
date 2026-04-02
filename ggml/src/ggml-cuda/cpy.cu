@@ -548,8 +548,21 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
     } else if (src0->type == GGML_TYPE_TQ3_0 && src1->type == GGML_TYPE_F32) {
-        // TurboQuant dequantize: TQ3_0 → F32
-        dequantize_row_tq3_0_cuda(src0_ddc, (float *)src1_ddc, ne, main_stream);
+        // TurboQuant dequantize: TQ3_0 → F32 (strided copy)
+        extern void tq3_cuda_cpy_to_f32(
+            const char * src, char * dst, int64_t ne,
+            int64_t ne00, int64_t ne01, int64_t ne02,
+            size_t nb00, size_t nb01, size_t nb02, size_t nb03,
+            int64_t ne10, int64_t ne11, int64_t ne12,
+            size_t nb10, size_t nb11, size_t nb12, size_t nb13,
+            cudaStream_t stream);
+        tq3_cuda_cpy_to_f32(
+            src0_ddc, src1_ddc, ne,
+            ne00, ne01, ne02,
+            nb00, nb01, nb02, nb03,
+            ne10, ne11, ne12,
+            nb10, nb11, nb12, nb13,
+            main_stream);
     } else {
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));

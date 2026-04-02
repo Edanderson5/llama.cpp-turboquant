@@ -49,8 +49,41 @@ void tq3_cuda_init(const float * pi_host, const float * s_host,
 
     h_d_pi = dp; h_d_s = ds; h_d_centroids = dc;
 
-    fprintf(stderr, "turboquant CUDA: device state ready (%.1f KB)\n",
-            (2 * mat_size + cent_size) / 1024.0f);
+    // Verify device globals are set
+    float * check_pi = nullptr;
+    float * check_cent = nullptr;
+    float check_qjl = 0.0f;
+    cudaMemcpyFromSymbol(&check_pi, d_pi, sizeof(float*));
+    cudaMemcpyFromSymbol(&check_cent, d_centroids, sizeof(float*));
+    cudaMemcpyFromSymbol(&check_qjl, d_qjl_factor, sizeof(float));
+    fprintf(stderr, "turboquant CUDA: device state ready (%.1f KB) pi=%p cent=%p qjl=%.6f\n",
+            (2 * mat_size + cent_size) / 1024.0f, (void*)check_pi, (void*)check_cent, check_qjl);
+
+    // Quick roundtrip test on GPU
+    {
+        float h_src[128], h_dst[128];
+        for (int i = 0; i < 128; i++) h_src[i] = (i == 0) ? 1.0f : 0.0f; // unit vector e_0
+        float * d_src, * d_dst;
+        block_tq3_0 * d_packed;
+        cudaMalloc(&d_src, 128*sizeof(float));
+        cudaMalloc(&d_dst, 128*sizeof(float));
+        cudaMalloc(&d_packed, sizeof(block_tq3_0));
+        cudaMemcpy(d_src, h_src, 128*sizeof(float), cudaMemcpyHostToDevice);
+
+        // Quantize
+        extern __global__ void k_test_quant(const float*, block_tq3_0*);
+        extern __global__ void k_test_dequant(const block_tq3_0*, float*);
+        k_test_quant<<<1, 1>>>(d_src, d_packed);
+        k_test_dequant<<<1, 1>>>(d_packed, d_dst);
+        cudaDeviceSynchronize();
+
+        cudaMemcpy(h_dst, d_dst, 128*sizeof(float), cudaMemcpyDeviceToHost);
+        float mse = 0;
+        for (int i = 0; i < 128; i++) { float d = h_src[i] - h_dst[i]; mse += d*d; }
+        fprintf(stderr, "turboquant CUDA: roundtrip test MSE=%.6f dst[0:3]=%.4f %.4f %.4f\n",
+                mse/128, h_dst[0], h_dst[1], h_dst[2]);
+        cudaFree(d_src); cudaFree(d_dst); cudaFree(d_packed);
+    }
 }
 
 void tq3_cuda_free() {
@@ -152,6 +185,18 @@ static __device__ void tq3_dequant_block(const block_tq3_0 * src, float * dst) {
 }
 
 // =====================================================================
+// Test kernels for roundtrip verification
+// =====================================================================
+
+__global__ void k_test_quant(const float * src, block_tq3_0 * dst) {
+    tq3_quantize_block(src, dst);
+}
+
+__global__ void k_test_dequant(const block_tq3_0 * src, float * dst) {
+    tq3_dequant_block(src, dst);
+}
+
+// =====================================================================
 // Set-rows kernel
 // =====================================================================
 
@@ -177,6 +222,7 @@ static __global__ void k_tq3_set_rows(
     tq3_quantize_block(sb, db);
 }
 
+static int g_set_rows_calls = 0;
 void tq3_cuda_set_rows(
     const float * src0_d, const void * src1_d, void * dst_d,
     int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
@@ -186,6 +232,11 @@ void tq3_cuda_set_rows(
     size_t nb1, size_t nb2, size_t nb3,
     bool idx64, cudaStream_t stream
 ) {
+    if (g_set_rows_calls < 3) {
+        fprintf(stderr, "TQ3 CUDA set_rows: ne00=%lld ne01=%lld nb01=%zu nb1=%zu idx64=%d\n",
+                (long long)ne00, (long long)ne01, nb01, nb1, (int)idx64);
+    }
+    g_set_rows_calls++;
     const int64_t n_heads = ne00 / TQ3_HEAD_DIM;
     const int64_t total = ne01 * n_heads;
     if (total <= 0) return;
@@ -207,6 +258,70 @@ void tq3_cuda_set_rows(
 
 // =====================================================================
 // Dequantize kernel (for cpy/dup TQ3_0 → F32)
+// =====================================================================
+
+// =====================================================================
+// Strided copy TQ3_0 → F32 (proper view handling)
+// =====================================================================
+
+static __global__ void k_tq3_cpy_to_f32(
+    const char * __restrict__ src, char * __restrict__ dst,
+    int64_t ne, int64_t ne00, int64_t ne01, int64_t ne02,
+    size_t nb00, size_t nb01, size_t nb02, size_t nb03,
+    int64_t ne10, int64_t ne11, int64_t ne12,
+    size_t nb10, size_t nb11, size_t nb12, size_t nb13
+) {
+    // Each thread handles one TQ3_0 block = 128 elements
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    const int64_t n_blocks_per_row = ne00 / TQ3_HEAD_DIM;
+    const int64_t total_blocks = n_blocks_per_row * ne01 * ne02;
+
+    if (i >= total_blocks) return;
+
+    // Decompose flat index into (block_in_row, row, layer)
+    const int64_t ib = i % n_blocks_per_row;
+    const int64_t i01 = (i / n_blocks_per_row) % ne01;
+    const int64_t i02 = i / (n_blocks_per_row * ne01);
+
+    // Source: TQ3_0 data with strides
+    // nb00 = type_size / blck_size * blck_size = 56 (for one block)
+    // nb01 = stride between rows in bytes
+    const block_tq3_0 * src_block = (const block_tq3_0 *)(src + i02*nb02 + i01*nb01) + ib;
+
+    // Destination: contiguous F32
+    float * dst_row = (float *)(dst + i02*nb12 + i01*nb11) + ib * TQ3_HEAD_DIM;
+
+    float tmp[TQ3_HEAD_DIM];
+    tq3_dequant_block(src_block, tmp);
+    for (int j = 0; j < TQ3_HEAD_DIM; j++) {
+        dst_row[j] = tmp[j];
+    }
+}
+
+void tq3_cuda_cpy_to_f32(
+    const char * src, char * dst, int64_t ne,
+    int64_t ne00, int64_t ne01, int64_t ne02,
+    size_t nb00, size_t nb01, size_t nb02, size_t nb03,
+    int64_t ne10, int64_t ne11, int64_t ne12,
+    size_t nb10, size_t nb11, size_t nb12, size_t nb13,
+    cudaStream_t stream
+) {
+    const int64_t n_blocks_per_row = ne00 / TQ3_HEAD_DIM;
+    const int64_t total_blocks = n_blocks_per_row * ne01 * ne02;
+    if (total_blocks <= 0) return;
+
+    const int bs = 32;
+    const int gs = (total_blocks + bs - 1) / bs;
+
+    k_tq3_cpy_to_f32<<<gs, bs, 0, stream>>>(
+        src, dst, ne, ne00, ne01, ne02,
+        nb00, nb01, nb02, nb03,
+        ne10, ne11, ne12,
+        nb10, nb11, nb12, nb13);
+}
+
+// =====================================================================
+// Flat dequantize (kept for reference)
 // =====================================================================
 
 static __global__ void k_dequant_tq3(const block_tq3_0 * __restrict__ src,
