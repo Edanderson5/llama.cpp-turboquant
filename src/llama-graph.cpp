@@ -1866,10 +1866,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
 
-        // TurboQuant: dequant TQ3_0 K/V to F32 first (supported by dup_from_q),
-        // then cast F32 → F16 for flash attention
+        // TurboQuant: cast TQ3_0 directly to F16 (single cast, no F32 intermediate)
         if (k->type == GGML_TYPE_TQ3_0) {
-            k = ggml_cast(ctx0, k, GGML_TYPE_F32);
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
 
@@ -1878,7 +1876,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         if (v->type == GGML_TYPE_TQ3_0) {
-            v = ggml_cast(ctx0, v, GGML_TYPE_F32);
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 

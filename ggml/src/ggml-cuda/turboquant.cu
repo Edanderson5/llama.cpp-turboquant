@@ -1,5 +1,6 @@
 // TurboQuant CUDA — all device code in one TU for __device__ global visibility
 #include "turboquant.cuh"
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cmath>
 
@@ -314,6 +315,68 @@ void tq3_cuda_cpy_to_f32(
     const int gs = (total_blocks + bs - 1) / bs;
 
     k_tq3_cpy_to_f32<<<gs, bs, 0, stream>>>(
+        src, dst, ne, ne00, ne01, ne02,
+        nb00, nb01, nb02, nb03,
+        ne10, ne11, ne12,
+        nb10, nb11, nb12, nb13);
+}
+
+// =====================================================================
+// Strided copy TQ3_0 → F16 (direct, skips F32 intermediate)
+// =====================================================================
+
+static __global__ void k_tq3_cpy_to_f16(
+    const char * __restrict__ src, char * __restrict__ dst,
+    int64_t ne, int64_t ne00, int64_t ne01, int64_t ne02,
+    size_t nb00, size_t nb01, size_t nb02, size_t nb03,
+    int64_t ne10, int64_t ne11, int64_t ne12,
+    size_t nb10, size_t nb11, size_t nb12, size_t nb13
+) {
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    const int64_t head_dim = ne00;  // TQ3 block size = head_dim, set dynamically
+    const int64_t n_blocks_per_row = ne00 / head_dim;  // should be 1 for per-head views
+    const int64_t total_blocks = n_blocks_per_row * ne01 * ne02;
+
+    // For head-dim views: ne00=head_dim, n_blocks_per_row=1
+    // For full-row views: ne00=n_heads*head_dim, n_blocks_per_row=n_heads
+    if (i >= total_blocks) return;
+
+    const int64_t ib = i % n_blocks_per_row;
+    const int64_t i01 = (i / n_blocks_per_row) % ne01;
+    const int64_t i02 = i / (n_blocks_per_row * ne01);
+
+    // Use the registered block size from GGML type traits
+    // For now, detect from nb00 (type_size for one block)
+    const int64_t blk_elems = head_dim;  // elements per TQ3 block
+
+    const block_tq3_0 * src_block = (const block_tq3_0 *)(src + i02*nb02 + i01*nb01) + ib;
+    half * dst_row = (half *)(dst + i02*nb12 + i01*nb11) + ib * blk_elems;
+
+    float tmp[256];  // max head_dim
+    tq3_dequant_block(src_block, tmp);
+
+    for (int j = 0; j < blk_elems && j < 256; j++) {
+        dst_row[j] = __float2half(tmp[j]);
+    }
+}
+
+void tq3_cuda_cpy_to_f16(
+    const char * src, char * dst, int64_t ne,
+    int64_t ne00, int64_t ne01, int64_t ne02,
+    size_t nb00, size_t nb01, size_t nb02, size_t nb03,
+    int64_t ne10, int64_t ne11, int64_t ne12,
+    size_t nb10, size_t nb11, size_t nb12, size_t nb13,
+    cudaStream_t stream
+) {
+    const int64_t head_dim = ne00;
+    const int64_t n_blocks_per_row = 1;  // head-dim view
+    const int64_t total_blocks = n_blocks_per_row * ne01 * ne02;
+    if (total_blocks <= 0) return;
+
+    const int bs = 32;
+    const int gs = (total_blocks + bs - 1) / bs;
+
+    k_tq3_cpy_to_f16<<<gs, bs, 0, stream>>>(
         src, dst, ne, ne00, ne01, ne02,
         nb00, nb01, nb02, nb03,
         ne10, ne11, ne12,
