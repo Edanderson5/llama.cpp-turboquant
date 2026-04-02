@@ -1,8 +1,10 @@
 // TurboQuant CUDA — all device code in one TU for __device__ global visibility
 #include "turboquant.cuh"
+#include "common.cuh"
 #include <cuda_fp16.h>
 #include <cstdio>
 #include <cmath>
+#include <cfloat>
 
 // =====================================================================
 // Device globals (only visible within this TU — no extern needed)
@@ -427,4 +429,155 @@ void dequantize_row_tq3_0_cuda(const void * src, float * dst, int64_t k, cudaStr
     const int64_t n = k / TQ3_HEAD_DIM;
     if (n <= 0) return;
     k_dequant_tq3<<<(n + 31) / 32, 32, 0, stream>>>((const block_tq3_0 *)src, dst, n);
+}
+
+// =====================================================================
+// Fused flash attention for TQ3_0 K (moved from fattn-tq3.cu)
+// Must be in same TU as device globals d_pi, d_s, d_centroids
+// =====================================================================
+
+#include <cfloat>
+
+template<int D>
+__global__ void flash_attn_tq3_vec_impl(
+    const float * __restrict__ Q,
+    const char  * __restrict__ K,
+    const char  * __restrict__ V,
+    const half  * __restrict__ mask_data,
+    float       * __restrict__ dst_data,
+    const float scale,
+    const int ne01, const int ne02, const int ne11, const int ne12,
+    const int k_nb1, const int k_nb2, const int64_t k_nb3,
+    const int v_nb1, const int v_nb2, const int64_t v_nb3,
+    const int q_nb1, const int q_nb2, const int q_nb3,
+    const int mask_nb1
+) {
+    const int head = blockIdx.x;
+    const int token = blockIdx.y;
+    const int seq = blockIdx.z;
+    const int lane = threadIdx.x;
+
+    if (head >= ne02 || token >= ne01) return;
+
+    const int kv_head = ne12 > 0 ? head / (ne02 / ne12) : 0;
+    const float * Q_head = (const float *)((const char *)Q + seq*q_nb3 + head*q_nb2 + token*q_nb1);
+
+    extern __shared__ float smem[];
+    float * Q_rot  = smem;
+    float * Q_proj = smem + D;
+
+    // Precompute Q_rot and Q_proj
+    for (int j = lane; j < D; j += 32) {
+        float acc_pi = 0.0f, acc_s = 0.0f;
+        for (int i = 0; i < D; i++) {
+            float qi = Q_head[i];
+            acc_pi += qi * d_pi[j * D + i];
+            acc_s  += qi * d_s[j * D + i];
+        }
+        Q_rot[j] = acc_pi;
+        Q_proj[j] = acc_s;
+    }
+    __syncwarp();
+
+    float KQ_max = -FLT_MAX;
+    float KQ_sum = 0.0f;
+    const int ept = (D + 31) / 32;
+    float VKQ[8]; // max ept
+    for (int e = 0; e < ept; e++) VKQ[e] = 0.0f;
+
+    for (int kv = 0; kv < ne11; kv++) {
+        const block_tq3_0 * K_block = (const block_tq3_0 *)(
+            K + seq*k_nb3 + kv_head*(int64_t)k_nb2 + (int64_t)kv*k_nb1);
+
+        float dot_mse = 0.0f, dot_qjl = 0.0f;
+        for (int j = lane; j < D; j += 32) {
+            int bp = j * 2;
+            int idx = (K_block->idx[bp / 8] >> (bp % 8)) & 0x3;
+            dot_mse += Q_rot[j] * d_centroids[idx];
+            float sf = (K_block->qjl_sign[j / 8] >> (j % 8)) & 1 ? 1.0f : -1.0f;
+            dot_qjl += Q_proj[j] * sf;
+        }
+        for (int m = 16; m > 0; m >>= 1) {
+            dot_mse += __shfl_xor_sync(0xffffffff, dot_mse, m);
+            dot_qjl += __shfl_xor_sync(0xffffffff, dot_qjl, m);
+        }
+
+        float KQ_val = K_block->x_norm * (dot_mse + d_qjl_factor * K_block->gamma * dot_qjl) * scale;
+
+        if (mask_data) {
+            const half * mr = (const half *)((const char *)mask_data + token * mask_nb1);
+            KQ_val += __half2float(mr[kv]);
+        }
+
+        float KQ_max_new = fmaxf(KQ_max, KQ_val);
+        float corr = expf(KQ_max - KQ_max_new);
+        KQ_sum = KQ_sum * corr + expf(KQ_val - KQ_max_new);
+        float w = expf(KQ_val - KQ_max_new);
+
+        const half * V_row = (const half *)(V + seq*v_nb3 + kv_head*(int64_t)v_nb2 + (int64_t)kv*v_nb1);
+        for (int e = 0; e < ept; e++) {
+            int i = lane + e * 32;
+            if (i < D) VKQ[e] = VKQ[e] * corr + w * __half2float(V_row[i]);
+        }
+        KQ_max = KQ_max_new;
+    }
+
+    float inv_sum = 1.0f / (KQ_sum + 1e-8f);
+    float * out = (float *)((char *)dst_data + seq*ne02*ne01*D*sizeof(float) +
+                             head*ne01*D*sizeof(float) + token*D*sizeof(float));
+    for (int e = 0; e < ept; e++) {
+        int i = lane + e * 32;
+        if (i < D) out[i] = VKQ[e] * inv_sum;
+    }
+}
+
+bool ggml_cuda_flash_attn_ext_tq3(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (K->type != GGML_TYPE_TQ3_0) return false;
+    if (V->type != GGML_TYPE_F16) return false;
+
+    const int D = Q->ne[0];
+    if (D != 128 && D != 256) return false;
+
+    float scale = 1.0f, max_bias = 0.0f;
+    memcpy(&scale, (const float *)dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *)dst->op_params + 1, sizeof(float));
+    if (max_bias != 0.0f) return false;
+
+    const int ne01 = Q->ne[1], ne02 = Q->ne[2], ne03 = Q->ne[3];
+    const int ne11 = K->ne[1], ne12 = K->ne[2];
+    const int smem = 2 * D * sizeof(float);
+
+    dim3 grid(ne02, ne01, ne03);
+    dim3 block(32);
+    cudaStream_t stream = ctx.stream();
+
+    const int mask_nb1 = mask ? mask->nb[1] : 0;
+
+    if (D == 128) {
+        flash_attn_tq3_vec_impl<128><<<grid, block, smem, stream>>>(
+            (const float *)Q->data, (const char *)K->data, (const char *)V->data,
+            mask ? (const half *)mask->data : nullptr,
+            (float *)dst->data, scale,
+            ne01, ne02, ne11, ne12,
+            K->nb[1], K->nb[2], K->nb[3],
+            V->nb[1], V->nb[2], V->nb[3],
+            Q->nb[1], Q->nb[2], Q->nb[3],
+            mask_nb1);
+    } else if (D == 256) {
+        flash_attn_tq3_vec_impl<256><<<grid, block, smem, stream>>>(
+            (const float *)Q->data, (const char *)K->data, (const char *)V->data,
+            mask ? (const half *)mask->data : nullptr,
+            (float *)dst->data, scale,
+            ne01, ne02, ne11, ne12,
+            K->nb[1], K->nb[2], K->nb[3],
+            V->nb[1], V->nb[2], V->nb[3],
+            Q->nb[1], Q->nb[2], Q->nb[3],
+            mask_nb1);
+    }
+    return true;
 }

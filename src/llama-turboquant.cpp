@@ -535,6 +535,35 @@ static void quantize_row_tq3_0(const float * src, void * dst, int64_t k) {
     }
 }
 
+// CPU vec_dot for TQ3_0: dequant K block, then F32 dot product with Q
+static void vec_dot_tq3_0_f32(int n, float * s, size_t bs, const void * vx, size_t bx,
+                               const void * vy, size_t by, int nrc) {
+    // vx = TQ3_0 packed data, vy = F32 query data
+    // n = number of elements (should be a multiple of head_dim)
+    if (!g_tq_state || !g_tq_state->enabled) { *s = 0; return; }
+
+    const auto & m = g_tq_state->m;
+    const auto & l = g_tq_state->layout;
+    const int d = m.head_dim;
+
+    assert(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    float tmp[256];  // max head_dim
+    float dot = 0.0f;
+    const uint8_t * xp = (const uint8_t *)vx;
+    const float * yp = (const float *)vy;
+
+    int n_blocks = n / d;
+    for (int b = 0; b < n_blocks; b++) {
+        dequant_head_row(m, l, xp + b * l.total_bytes, tmp);
+        for (int i = 0; i < d; i++) {
+            dot += tmp[i] * yp[b * d + i];
+        }
+    }
+    *s = dot;
+}
+
 void register_ggml_type(const state & st) {
     g_tq_state = &st;
 
@@ -560,6 +589,14 @@ void register_ggml_type(const state & st) {
         GGML_TYPE_TQ3_0,
         (ggml_from_float_t)quantize_row_tq3_0
     );
+
+    // Register vec_dot for CPU flash attention (dequant + F32 dot)
+    ggml_set_type_traits_cpu_vec_dot(
+        GGML_TYPE_TQ3_0,
+        (ggml_vec_dot_t)vec_dot_tq3_0_f32,
+        GGML_TYPE_F32  // vec_dot_type: Q gets converted to F32
+    );
+
 
     // Initialize CUDA device state if CUDA is available
 #ifdef GGML_USE_CUDA

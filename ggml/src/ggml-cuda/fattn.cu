@@ -283,8 +283,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
-    // TurboQuant: K=TQ3_0, V=F16 (V is cast to F16 in the graph)
-    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ3_0, GGML_TYPE_F16)
 
     GGML_ABORT("fatal error");
 }
@@ -499,8 +497,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// Forward declaration for TQ3 fused kernel
+extern bool ggml_cuda_flash_attn_ext_tq3(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // TurboQuant: use fused O(d) kernel when K is TQ3_0
+    if (dst->src[1]->type == GGML_TYPE_TQ3_0) {
+        if (ggml_cuda_flash_attn_ext_tq3(ctx, dst)) {
+            return;
+        }
+        // Fused kernel didn't handle this — this shouldn't happen if supported() returned true
+        GGML_ABORT("TQ3 fused attn failed: Q type=%d K type=%d V type=%d ne01=%d D=%d",
+                    dst->src[0]->type, dst->src[1]->type, dst->src[2]->type,
+                    (int)dst->src[0]->ne[1], (int)dst->src[0]->ne[0]);
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -520,5 +533,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    // TurboQuant K: fused kernel handles it in the dispatch
+    if (dst->src[1]->type == GGML_TYPE_TQ3_0) {
+        return true;
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

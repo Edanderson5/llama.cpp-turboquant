@@ -409,6 +409,11 @@ void ggml_set_type_traits_cpu_from_float(enum ggml_type type, ggml_from_float_t 
     type_traits_cpu[type].from_float = from_float;
 }
 
+void ggml_set_type_traits_cpu_vec_dot(enum ggml_type type, ggml_vec_dot_t vec_dot, enum ggml_type vec_dot_type) {
+    type_traits_cpu[type].vec_dot = vec_dot;
+    type_traits_cpu[type].vec_dot_type = vec_dot_type;
+}
+
 //
 // Threading defs
 //
