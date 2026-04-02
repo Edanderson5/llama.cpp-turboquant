@@ -726,6 +726,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    [GGML_TYPE_TQ3_0] = {
+        .type_name                = "tq3_0",
+        .blck_size                = 128,  // TurboQuant block = head_dim (fixed 128)
+        .type_size                = 56,   // packed: 32B idx + 4B norm + 16B signs + 4B gamma
+        .is_quantized             = true,
+        .to_float                 = NULL, // dequantize — will be set by turboquant::init
+        .from_float_ref           = NULL, // quantize — will be set by turboquant::init
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
