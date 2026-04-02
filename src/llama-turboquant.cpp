@@ -229,11 +229,11 @@ void quantize_head_row(
     }
 
     // 2. Rotate: y = x_unit @ Pi^T  (Pi is row-major [d,d])
-    // y[j] = sum_i x_unit[i] * Pi[i][j] = sum_i x_unit[i] * pi[i*d + j]
+    // y[j] = sum_i x_unit[i] * Pi^T[i][j] = sum_i x_unit[i] * Pi[j][i] = sum_i x_unit[i] * pi[j*d + i]
     for (int j = 0; j < d; j++) {
         float s = 0.0f;
         for (int i = 0; i < d; i++) {
-            s += x_unit[i] * m.pi[i * d + j];
+            s += x_unit[i] * m.pi[j * d + i];
         }
         y[j] = s;
     }
@@ -274,11 +274,11 @@ void quantize_head_row(
     gamma = std::sqrt(gamma);
 
     // 6. QJL: u = r @ S^T, sign = (u >= 0)
-    // u[j] = sum_i r[i] * S[i][j] = sum_i r[i] * s[i*d + j]
+    // u[j] = sum_i r[i] * S^T[i][j] = sum_i r[i] * S[j][i] = sum_i r[i] * s[j*d + i]
     for (int j = 0; j < d; j++) {
         float s = 0.0f;
         for (int i = 0; i < d; i++) {
-            s += r[i] * m.s[i * d + j];
+            s += r[i] * m.s[j * d + i];
         }
         signs[j] = (s >= 0.0f);
     }
@@ -481,8 +481,13 @@ std::unique_ptr<state> init(
 // Global state pointer for the stateless GGML function pointer callbacks
 static const state * g_tq_state = nullptr;
 
+static int g_dequant_calls = 0;
 static void dequantize_row_tq3_0(const void * src, float * dst, int64_t k) {
-    if (!g_tq_state || !g_tq_state->enabled) return;
+    if (!g_tq_state || !g_tq_state->enabled) {
+        // Fill with zeros if state not available
+        for (int64_t i = 0; i < k; i++) dst[i] = 0.0f;
+        return;
+    }
 
     const auto & m = g_tq_state->m;
     const auto & l = g_tq_state->layout;
@@ -490,12 +495,29 @@ static void dequantize_row_tq3_0(const void * src, float * dst, int64_t k) {
     const int n_blocks = (int)(k / d);
     const uint8_t * src_u8 = (const uint8_t *)src;
 
+    if (g_dequant_calls < 50) {
+        // Check if any byte in this block is non-zero
+        int nonzero = 0;
+        for (int64_t i = 0; i < n_blocks * (int64_t)l.total_bytes && i < 1000; i++) {
+            if (src_u8[i]) nonzero++;
+        }
+        fprintf(stderr, "TQ3 dequant: k=%lld n_blocks=%d nonzero_bytes=%d/%lld src=%p\n",
+                (long long)k, n_blocks, nonzero, (long long)(n_blocks * l.total_bytes), src);
+    }
+    g_dequant_calls++;
+
     for (int b = 0; b < n_blocks; b++) {
         dequant_head_row(m, l, src_u8 + b * l.total_bytes, dst + b * d);
     }
 }
 
+static int g_quant_calls = 0;
 static void quantize_row_tq3_0(const float * src, void * dst, int64_t k) {
+    if (g_quant_calls < 3) {
+        fprintf(stderr, "TQ3 quant: k=%lld src[0:3]=%.4f %.4f %.4f dst_ptr=%p\n",
+                (long long)k, src[0], src[1], src[2], dst);
+    }
+    g_quant_calls++;
     if (!g_tq_state || !g_tq_state->enabled) return;
 
     const auto & m = g_tq_state->m;
