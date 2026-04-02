@@ -325,6 +325,8 @@ void tq3_cuda_cpy_to_f32(
 // Strided copy TQ3_0 → F16 (direct, skips F32 intermediate)
 // =====================================================================
 
+// Optimized v3: precompute centroid vector and sign vector, then matmul
+// Eliminates redundant index lookups in the inner loop
 static __global__ void k_tq3_cpy_to_f16(
     const char * __restrict__ src, char * __restrict__ dst,
     int64_t ne, int64_t ne00, int64_t ne01, int64_t ne02,
@@ -332,31 +334,50 @@ static __global__ void k_tq3_cpy_to_f16(
     int64_t ne10, int64_t ne11, int64_t ne12,
     size_t nb10, size_t nb11, size_t nb12, size_t nb13
 ) {
-    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
-    const int64_t head_dim = ne00;  // TQ3 block size = head_dim, set dynamically
-    const int64_t n_blocks_per_row = ne00 / head_dim;  // should be 1 for per-head views
-    const int64_t total_blocks = n_blocks_per_row * ne01 * ne02;
+    // Block layout: blockDim.x=32 (warp), blockDim.y=warps_per_block
+    const int warp_id = blockIdx.x * blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x;
 
-    // For head-dim views: ne00=head_dim, n_blocks_per_row=1
-    // For full-row views: ne00=n_heads*head_dim, n_blocks_per_row=n_heads
-    if (i >= total_blocks) return;
+    const int d = (int)ne00;
+    const int64_t total_blocks = ne01 * ne02;
+    if (warp_id >= total_blocks) return;
 
-    const int64_t ib = i % n_blocks_per_row;
-    const int64_t i01 = (i / n_blocks_per_row) % ne01;
-    const int64_t i02 = i / (n_blocks_per_row * ne01);
+    const int64_t i01 = warp_id % ne01;
+    const int64_t i02 = warp_id / ne01;
 
-    // Use the registered block size from GGML type traits
-    // For now, detect from nb00 (type_size for one block)
-    const int64_t blk_elems = head_dim;  // elements per TQ3 block
+    const block_tq3_0 * sb = (const block_tq3_0 *)(src + i02*nb02 + i01*nb01);
+    half * dr = (half *)(dst + i02*nb12 + i01*nb11);
 
-    const block_tq3_0 * src_block = (const block_tq3_0 *)(src + i02*nb02 + i01*nb01) + ib;
-    half * dst_row = (half *)(dst + i02*nb12 + i01*nb11) + ib * blk_elems;
+    const float xn = sb->x_norm;
+    const float gm = sb->gamma;
+    const float qf = d_qjl_factor;
 
-    float tmp[256];  // max head_dim
-    tq3_dequant_block(src_block, tmp);
+    // Shared memory: precomputed y_tilde (centroid values) and sign_f
+    // These are the same for all output elements within one block
+    extern __shared__ float smem[];
+    const int smem_offset = threadIdx.y * d * 2;
+    float * y_tilde = smem + smem_offset;
+    float * sign_f  = smem + smem_offset + d;
 
-    for (int j = 0; j < blk_elems && j < 256; j++) {
-        dst_row[j] = __float2half(tmp[j]);
+    // Step 1: Cooperatively decode idx→centroid and sign bits (O(d/32) per thread)
+    for (int j = lane; j < d; j += 32) {
+        int bp = j * 2;
+        int idx = (sb->idx[bp / 8] >> (bp % 8)) & 0x3;
+        y_tilde[j] = d_centroids[idx];
+        sign_f[j] = (sb->qjl_sign[j / 8] >> (j % 8)) & 1 ? 1.0f : -1.0f;
+    }
+    __syncwarp();
+
+    // Step 2: Matmul — each lane handles d/32 output elements
+    // dst[i] = xn * (sum_j y_tilde[j]*Pi[j*d+i] + qf*gm * sum_j sign_f[j]*S[j*d+i])
+    for (int i = lane; i < d; i += 32) {
+        float acc_mse = 0.0f;
+        float acc_qjl = 0.0f;
+        for (int j = 0; j < d; j++) {
+            acc_mse += y_tilde[j] * __ldg(&d_pi[j * d + i]);
+            acc_qjl += sign_f[j]  * __ldg(&d_s[j * d + i]);
+        }
+        dr[i] = __float2half(xn * (acc_mse + qf * gm * acc_qjl));
     }
 }
 
@@ -373,10 +394,18 @@ void tq3_cuda_cpy_to_f16(
     const int64_t total_blocks = n_blocks_per_row * ne01 * ne02;
     if (total_blocks <= 0) return;
 
-    const int bs = 32;
-    const int gs = (total_blocks + bs - 1) / bs;
+    // Use warp-based launch: 32 threads per warp, N warps per CUDA block
+    // Each warp needs 2*d floats of shared memory for y_tilde + sign_f
+    const int d = (int)ne00;
+    const int smem_per_warp = 2 * d * sizeof(float);
+    const int max_smem = 48 * 1024;  // 48KB typical
+    const int warps_per_block = max_smem / smem_per_warp;
+    const int wpb = warps_per_block > 4 ? 4 : (warps_per_block > 0 ? warps_per_block : 1);
+    dim3 block(32, wpb);
+    dim3 grid((total_blocks + wpb - 1) / wpb);
+    const int smem_size = wpb * smem_per_warp;
 
-    k_tq3_cpy_to_f16<<<gs, bs, 0, stream>>>(
+    k_tq3_cpy_to_f16<<<grid, block, smem_size, stream>>>(
         src, dst, ne, ne00, ne01, ne02,
         nb00, nb01, nb02, nb03,
         ne10, ne11, ne12,
