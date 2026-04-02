@@ -103,4 +103,8 @@ std::unique_ptr<state> init(
     int head_dim
 );
 
+// Register dequantize/quantize function pointers in the GGML type traits table
+// Must be called after loading the sidecar (needs Pi/S/centroids state)
+void register_ggml_type(const state & st);
+
 } // namespace turboquant

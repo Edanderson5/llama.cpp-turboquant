@@ -606,7 +606,7 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 
 }
 
-static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+static struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I8] = {
         .type_name                = "i8",
         .blck_size                = 1,
@@ -918,6 +918,13 @@ const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
     return &type_traits[type];
+}
+
+void ggml_set_type_traits_funcs(enum ggml_type type, ggml_to_float_t to_float, ggml_from_float_t from_float) {
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
+    type_traits[type].to_float = to_float;
+    type_traits[type].from_float_ref = from_float;
 }
 
 //

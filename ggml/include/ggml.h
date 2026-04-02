@@ -2735,6 +2735,9 @@ extern "C" {
 
     GGML_API const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type);
 
+    // Set quantize/dequantize functions for a type at runtime (for plugin types like TQ3_0)
+    GGML_API void ggml_set_type_traits_funcs(enum ggml_type type, ggml_to_float_t to_float, ggml_from_float_t from_float);
+
     // ggml threadpool
     // TODO: currently, only a few functions are in the base ggml API, while the rest are in the CPU backend
     // the goal should be to create an API that other backends can use move everything to the ggml base

@@ -2521,6 +2521,9 @@ void llama_kv_cache::init_turboquant(const std::string & tqmeta_path, uint32_t k
 
     try {
         tq_state = turboquant::init(tqmeta_path, kv_size, (int)layers.size(), n_kv_heads, head_dim);
+        if (tq_state && tq_state->enabled) {
+            turboquant::register_ggml_type(*tq_state);
+        }
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: turboquant init failed: %s\n", __func__, e.what());
         tq_state.reset();

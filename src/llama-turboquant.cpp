@@ -473,4 +473,51 @@ std::unique_ptr<state> init(
     return st;
 }
 
+// -------------------------------------------------------------------------
+// GGML type registration: wire TQ3_0 dequant/quant into type traits
+// -------------------------------------------------------------------------
+
+// Global state pointer for the stateless GGML function pointer callbacks
+static const state * g_tq_state = nullptr;
+
+static void dequantize_row_tq3_0(const void * src, float * dst, int64_t k) {
+    if (!g_tq_state || !g_tq_state->enabled) return;
+
+    const auto & m = g_tq_state->m;
+    const auto & l = g_tq_state->layout;
+    const int d = m.head_dim;
+    const int n_blocks = (int)(k / d);
+    const uint8_t * src_u8 = (const uint8_t *)src;
+
+    for (int b = 0; b < n_blocks; b++) {
+        dequant_head_row(m, l, src_u8 + b * l.total_bytes, dst + b * d);
+    }
+}
+
+static void quantize_row_tq3_0(const float * src, void * dst, int64_t k) {
+    if (!g_tq_state || !g_tq_state->enabled) return;
+
+    const auto & m = g_tq_state->m;
+    const auto & l = g_tq_state->layout;
+    const int d = m.head_dim;
+    const int n_blocks = (int)(k / d);
+    uint8_t * dst_u8 = (uint8_t *)dst;
+
+    for (int b = 0; b < n_blocks; b++) {
+        quantize_head_row(m, l, src + b * d, dst_u8 + b * l.total_bytes);
+    }
+}
+
+void register_ggml_type(const state & st) {
+    g_tq_state = &st;
+
+    ggml_set_type_traits_funcs(
+        GGML_TYPE_TQ3_0,
+        (ggml_to_float_t)dequantize_row_tq3_0,
+        (ggml_from_float_t)quantize_row_tq3_0
+    );
+
+    fprintf(stderr, "turboquant: registered GGML_TYPE_TQ3_0 dequant/quant functions\n");
+}
+
 } // namespace turboquant
