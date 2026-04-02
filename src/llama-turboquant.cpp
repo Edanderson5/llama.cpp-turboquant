@@ -538,6 +538,16 @@ static void quantize_row_tq3_0(const float * src, void * dst, int64_t k) {
 void register_ggml_type(const state & st) {
     g_tq_state = &st;
 
+    // Set block size and type size based on actual head_dim from sidecar
+    ggml_set_type_traits_size(
+        GGML_TYPE_TQ3_0,
+        st.m.head_dim,           // block_size = head_dim (128 or 256)
+        st.layout.total_bytes    // type_size = packed bytes per block
+    );
+
+    fprintf(stderr, "turboquant: set TQ3_0 block_size=%d type_size=%u\n",
+            st.m.head_dim, st.layout.total_bytes);
+
     // Register in the base type traits (used by flash attention to_float, cast, etc.)
     ggml_set_type_traits_funcs(
         GGML_TYPE_TQ3_0,

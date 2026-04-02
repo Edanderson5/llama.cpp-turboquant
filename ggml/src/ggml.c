@@ -927,6 +927,13 @@ void ggml_set_type_traits_funcs(enum ggml_type type, ggml_to_float_t to_float, g
     type_traits[type].from_float_ref = from_float;
 }
 
+void ggml_set_type_traits_size(enum ggml_type type, int64_t blck_size, size_t type_size) {
+    assert(type >= 0);
+    assert(type < GGML_TYPE_COUNT);
+    type_traits[type].blck_size = blck_size;
+    type_traits[type].type_size = type_size;
+}
+
 //
 // ggml object
 //
