@@ -11,6 +11,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cassert>
@@ -511,9 +512,16 @@ static void quantize_row_tq3_0(const float * src, void * dst, int64_t k) {
 void register_ggml_type(const state & st) {
     g_tq_state = &st;
 
+    // Register in the base type traits (used by flash attention to_float, cast, etc.)
     ggml_set_type_traits_funcs(
         GGML_TYPE_TQ3_0,
         (ggml_to_float_t)dequantize_row_tq3_0,
+        (ggml_from_float_t)quantize_row_tq3_0
+    );
+
+    // Register in the CPU backend traits (used by set_rows from_float, dup, etc.)
+    ggml_set_type_traits_cpu_from_float(
+        GGML_TYPE_TQ3_0,
         (ggml_from_float_t)quantize_row_tq3_0
     );
 

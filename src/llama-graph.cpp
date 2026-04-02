@@ -1866,7 +1866,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
 
+        // TurboQuant: dequant TQ3_0 K/V to F16 before flash attention
+        // (flash attn doesn't have a native vec_dot for TQ3_0)
+        if (k->type == GGML_TYPE_TQ3_0) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+
         if (v->type == GGML_TYPE_F32) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+
+        if (v->type == GGML_TYPE_TQ3_0) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 

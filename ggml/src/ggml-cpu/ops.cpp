@@ -568,6 +568,40 @@ void ggml_compute_forward_dup(
                     ggml_compute_forward_dup_from_q(params, dst);
                     break;
                 }
+                if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F16) {
+                    // Quantized → F16: dequant to F32 scratch then convert to F16
+                    // Used by TurboQuant KV cache cast before flash attention
+                    ggml_to_float_t const dequantize_row = ggml_get_type_traits(src0->type)->to_float;
+                    if (dequantize_row) {
+                        const int64_t ne = ggml_nelements(dst);
+                        const int64_t blck_size = ggml_blck_size(src0->type);
+                        const int ith = params->ith;
+                        const int nth = params->nth;
+                        const int64_t dr = (ne + nth - 1) / nth;
+                        const int64_t ir0 = dr * ith;
+                        const int64_t ir1 = ir0 + dr > ne ? ne : ir0 + dr;
+                        // Align to block boundaries
+                        const int64_t br0 = (ir0 / blck_size) * blck_size;
+                        const int64_t br1 = ir1;
+                        const size_t src_type_size = ggml_type_size(src0->type);
+                        // Temp buffer for one block worth of F32 data
+                        float tmp[256]; // max head_dim
+                        ggml_fp16_t * dst_f16 = (ggml_fp16_t *)dst->data;
+                        for (int64_t i = br0; i < br1; i += blck_size) {
+                            int64_t count = blck_size;
+                            if (i + count > ne) count = ne - i;
+                            dequantize_row(
+                                (const char *)src0->data + (i / blck_size) * src_type_size,
+                                tmp, count);
+                            for (int64_t j = 0; j < count && (i + j) < ir1; j++) {
+                                if ((i + j) >= ir0) {
+                                    dst_f16[i + j] = GGML_FP32_TO_FP16(tmp[j]);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
                 GGML_ABORT("fatal error");
             }
     }
@@ -678,6 +712,7 @@ void ggml_compute_forward_add(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -1128,6 +1163,7 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -1257,6 +1293,7 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4345,6 +4382,7 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4621,6 +4659,7 @@ void ggml_compute_forward_set(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4844,6 +4883,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -5569,6 +5609,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
