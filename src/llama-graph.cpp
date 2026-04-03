@@ -1866,9 +1866,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
 
-        // TurboQuant K: pass directly to flash attention
-        // CPU: uses vec_dot_tq3_0_f32 (dequant + F32 dot product)
-        // CUDA: uses fused kernel from fattn-tq3.cu (O(d) per KV token)
+        // TurboQuant: cast K to F16 for server-mode reliability
+        if (k->type == GGML_TYPE_TQ3_0) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
 
         if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
